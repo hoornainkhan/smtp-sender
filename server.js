@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(helmet({
-    contentSecurityPolicy: false, // Disable CSP for simplicity
+    contentSecurityPolicy: false,
     crossOriginEmbedderPolicy: false
 }));
 app.use(cors());
@@ -70,14 +70,14 @@ function createTransporter(smtpConfig, proxyConfig = null) {
         greetingTimeout: parseInt(smtpConfig.timeout || 30000),
         socketTimeout: parseInt(smtpConfig.timeout || 30000),
         pool: true,
-        maxConnections: 20,
+        maxConnections: 5,
         maxMessages: Infinity
     };
 
     if (proxyConfig && proxyConfig.host) {
         try {
             const proxyUrl = proxyConfig.auth 
-                ? `${proxyConfig.protocol}://${proxyConfig.auth.user}:${proxyConfig.auth.pass}@${proxyConfig.host}:${proxyConfig.port}`
+                ? `${proxyConfig.protocol}://${encodeURIComponent(proxyConfig.auth.user)}:${encodeURIComponent(proxyConfig.auth.pass)}@${proxyConfig.host}:${proxyConfig.port}`
                 : `${proxyConfig.protocol}://${proxyConfig.host}:${proxyConfig.port}`;
             
             if (proxyConfig.protocol === 'socks5' || proxyConfig.protocol === 'socks4') {
@@ -170,19 +170,55 @@ app.post('/api/test-connection', async (req, res) => {
 // Start bulk sending
 app.post('/api/send-bulk', async (req, res) => {
     try {
-        const { smtpConfig, recipients, ccRecipients, bccRecipients, emailContent, sendingOptions, proxyList } = req.body;
+        const { 
+            smtpConfig, 
+            smtpConfigs,  // NEW: Array of SMTP configs
+            smtpRotation, // NEW: Rotation mode
+            recipients, 
+            ccRecipients, 
+            bccRecipients, 
+            emailContent, 
+            sendingOptions, 
+            proxyList 
+        } = req.body;
 
-        if (!smtpConfig || !recipients || !emailContent) {
+        // Determine which SMTP configs to use
+        let allSmtpConfigs = [];
+        
+        if (smtpConfigs && smtpConfigs.length > 0) {
+            // Use multi-SMTP configs
+            allSmtpConfigs = smtpConfigs;
+        } else if (smtpConfig) {
+            // Use single SMTP config
+            allSmtpConfigs = [smtpConfig];
+        } else {
             return res.status(400).json({
                 success: false,
-                message: 'Missing required fields'
+                message: 'No SMTP configuration provided'
             });
         }
 
-        if (!Array.isArray(recipients) || recipients.length === 0) {
+        if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
             return res.status(400).json({
                 success: false,
                 message: 'No recipients provided'
+            });
+        }
+
+        if (!emailContent || !emailContent.subject || !emailContent.messageBody) {
+            return res.status(400).json({
+                success: false,
+                message: 'Email subject and body are required'
+            });
+        }
+
+        // Filter only working SMTPs if status is available
+        const workingSmtps = allSmtpConfigs.filter(s => !s.status || s.status === 'working' || s.status === 'pending');
+        
+        if (workingSmtps.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'No working SMTP configurations available'
             });
         }
 
@@ -199,7 +235,8 @@ app.post('/api/send-bulk', async (req, res) => {
                 remaining: recipients.length
             },
             logs: [],
-            stopRequested: false
+            stopRequested: false,
+            smtpCount: workingSmtps.length
         };
         
         activeJobs.set(jobId, job);
@@ -207,11 +244,21 @@ app.post('/api/send-bulk', async (req, res) => {
         res.json({
             success: true,
             jobId: jobId,
-            message: `Bulk sending started for ${recipients.length} recipients`
+            message: `Bulk sending started for ${recipients.length} recipients using ${workingSmtps.length} SMTP servers`
         });
 
-        processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccRecipients, 
-                        emailContent, sendingOptions, proxyList).catch(error => {
+        // Process in background
+        processBulkSend(
+            jobId, 
+            workingSmtps, 
+            smtpRotation || 'random',
+            recipients, 
+            ccRecipients, 
+            bccRecipients, 
+            emailContent, 
+            sendingOptions, 
+            proxyList
+        ).catch(error => {
             console.error(`Job ${jobId} failed:`, error);
             const job = activeJobs.get(jobId);
             if (job) {
@@ -228,8 +275,8 @@ app.post('/api/send-bulk', async (req, res) => {
     }
 });
 
-// Process bulk sending
-async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccRecipients, 
+// Process bulk sending with multiple SMTPs
+async function processBulkSend(jobId, smtpConfigs, smtpRotation, recipients, ccRecipients, bccRecipients, 
                                emailContent, sendingOptions, proxyList) {
     const job = activeJobs.get(jobId);
     if (!job) return;
@@ -240,8 +287,63 @@ async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccR
         const maxRetries = parseInt(sendingOptions?.maxRetries || 3);
         const threads = parseInt(sendingOptions?.threads || 5);
 
-        let transporters = new Map();
+        let currentSmtpIndex = 0;
+        let currentProxyIndex = 0;
+        
+        // Cache for transporters to reuse connections
+        const transporterCache = new Map();
 
+        // Function to get next SMTP config based on rotation
+        function getNextSmtpConfig() {
+            if (!smtpConfigs || smtpConfigs.length === 0) return null;
+            
+            let index;
+            switch (smtpRotation) {
+                case 'random':
+                    index = Math.floor(Math.random() * smtpConfigs.length);
+                    break;
+                case 'roundrobin':
+                    index = currentSmtpIndex % smtpConfigs.length;
+                    currentSmtpIndex++;
+                    break;
+                case 'sequential':
+                default:
+                    index = currentSmtpIndex % smtpConfigs.length;
+                    currentSmtpIndex++;
+                    break;
+            }
+            
+            return smtpConfigs[index];
+        }
+
+        // Function to get or create transporter
+        function getTransporter(smtpConfig) {
+            const key = `${smtpConfig.host}:${smtpConfig.port}:${smtpConfig.username}`;
+            
+            if (!transporterCache.has(key)) {
+                let proxyConfig = null;
+                
+                // Assign proxy if available
+                if (proxyList && proxyList.length > 0) {
+                    const proxyString = getNextProxy(proxyList, sendingOptions?.proxyRotation, currentProxyIndex);
+                    currentProxyIndex++;
+                    proxyConfig = parseProxy(proxyString);
+                }
+                
+                const transporter = createTransporter(smtpConfig, proxyConfig);
+                transporterCache.set(key, transporter);
+                
+                job.logs.push({
+                    timestamp: new Date(),
+                    type: 'info',
+                    message: `Created transporter for ${smtpConfig.host} (${smtpConfig.username})`
+                });
+            }
+            
+            return transporterCache.get(key);
+        }
+
+        // Process recipients in batches
         for (let i = 0; i < recipients.length; i += batchSize) {
             if (job.stopRequested) {
                 job.logs.push({
@@ -254,32 +356,32 @@ async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccR
 
             const batch = recipients.slice(i, i + batchSize);
             
-            const promises = batch.map(async (recipient, batchIndex) => {
+            // Process batch with concurrency control
+            const promises = batch.map(async (recipient) => {
                 if (job.stopRequested) return null;
 
+                // Get a different SMTP for each recipient (round-robin within batch)
+                const smtpConfig = getNextSmtpConfig();
+                
+                if (!smtpConfig) {
+                    job.stats.failed++;
+                    job.stats.remaining = job.stats.total - job.stats.sent - job.stats.failed;
+                    job.logs.push({
+                        timestamp: new Date(),
+                        type: 'error',
+                        message: `❌ No SMTP available for ${recipient}`
+                    });
+                    return { success: false, recipient, error: 'No SMTP available' };
+                }
+
                 try {
-                    let transporterKey = 'default';
-                    let proxyIndex = i + batchIndex;
+                    const transporter = getTransporter(smtpConfig);
                     
-                    if (proxyList && proxyList.length > 0) {
-                        const proxyString = getNextProxy(proxyList, sendingOptions.proxyRotation, proxyIndex);
-                        transporterKey = proxyString;
-                        
-                        if (!transporters.has(transporterKey)) {
-                            const proxyConfig = parseProxy(proxyString);
-                            if (proxyConfig) {
-                                transporters.set(transporterKey, createTransporter(smtpConfig, proxyConfig));
-                            }
-                        }
-                    } else if (!transporters.has('default')) {
-                        transporters.set('default', createTransporter(smtpConfig));
-                    }
-                    
-                    const transporter = transporters.get(transporterKey);
                     if (!transporter) {
                         throw new Error('Failed to create transporter');
                     }
                     
+                    // Prepare email options
                     const mailOptions = {
                         from: emailContent.fromName 
                             ? `"${emailContent.fromName}" <${emailContent.fromEmail || smtpConfig.username}>`
@@ -289,8 +391,9 @@ async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccR
                         text: emailContent.contentType === 'text' ? emailContent.messageBody : undefined,
                         html: emailContent.contentType === 'html' ? emailContent.messageBody : undefined,
                         headers: {
-                            'X-Mailer': 'SMTP Bulk Sender',
-                            'X-Priority': '3'
+                            'X-Mailer': 'SMTP Bulk Sender Multi-SMTP',
+                            'X-Priority': '3',
+                            'X-SMTP-Host': smtpConfig.host
                         }
                     };
 
@@ -308,6 +411,7 @@ async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccR
                         }));
                     }
 
+                    // Send with retry logic
                     let lastError;
                     for (let attempt = 0; attempt <= maxRetries; attempt++) {
                         if (job.stopRequested) break;
@@ -320,9 +424,9 @@ async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccR
                                 job.logs.push({
                                     timestamp: new Date(),
                                     type: 'success',
-                                    message: `✅ Sent to ${recipient}`
+                                    message: `✅ Sent to ${recipient} via ${smtpConfig.host}`
                                 });
-                                return { success: true, recipient };
+                                return { success: true, recipient, smtp: smtpConfig.host };
                             } else {
                                 lastError = result.error;
                             }
@@ -331,6 +435,15 @@ async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccR
                         }
                         
                         if (attempt < maxRetries) {
+                            // Get a different SMTP for retry
+                            const retrySmtp = getNextSmtpConfig();
+                            if (retrySmtp && retrySmtp !== smtpConfig) {
+                                job.logs.push({
+                                    timestamp: new Date(),
+                                    type: 'info',
+                                    message: `🔄 Retrying ${recipient} with ${retrySmtp.host} (Attempt ${attempt + 2}/${maxRetries + 1})`
+                                });
+                            }
                             await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
                         }
                     }
@@ -343,12 +456,13 @@ async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccR
                     job.logs.push({
                         timestamp: new Date(),
                         type: 'error',
-                        message: `❌ Failed to send to ${recipient}: ${error.message}`
+                        message: `❌ Failed to send to ${recipient} via ${smtpConfig.host}: ${error.message}`
                     });
-                    return { success: false, recipient, error: error.message };
+                    return { success: false, recipient, smtp: smtpConfig.host, error: error.message };
                 }
             });
 
+            // Process with thread limit
             const chunks = [];
             for (let j = 0; j < promises.length; j += threads) {
                 chunks.push(promises.slice(j, j + threads));
@@ -359,13 +473,24 @@ async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccR
                 await Promise.allSettled(chunk);
             }
 
+            // Progress update
+            const progressPercent = Math.round((job.stats.sent / job.stats.total) * 100);
+            console.log(`Job ${jobId}: ${progressPercent}% complete (${job.stats.sent}/${job.stats.total})`);
+
+            // Delay between batches
             if (i + batchSize < recipients.length && !job.stopRequested) {
                 await new Promise(resolve => setTimeout(resolve, delay));
             }
         }
 
-        for (const transporter of transporters.values()) {
-            transporter.close();
+        // Clean up transporters
+        for (const [key, transporter] of transporterCache.entries()) {
+            try {
+                transporter.close();
+                console.log(`Closed transporter: ${key}`);
+            } catch (error) {
+                console.error(`Error closing transporter ${key}:`, error);
+            }
         }
 
         job.status = job.stopRequested ? 'stopped' : 'completed';
@@ -373,7 +498,7 @@ async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccR
         job.logs.push({
             timestamp: new Date(),
             type: 'info',
-            message: `📊 Bulk sending ${job.status}. Sent: ${job.stats.sent}, Failed: ${job.stats.failed}`
+            message: `📊 Bulk sending ${job.status}. Sent: ${job.stats.sent}, Failed: ${job.stats.failed}, Total: ${job.stats.total}, SMTPs Used: ${smtpConfigs.length}`
         });
 
     } catch (error) {
@@ -384,9 +509,11 @@ async function processBulkSend(jobId, smtpConfig, recipients, ccRecipients, bccR
             type: 'error',
             message: `💥 Fatal error: ${error.message}`
         });
+        console.error(`Job ${jobId} error:`, error);
     }
 }
 
+// Get next proxy based on rotation
 function getNextProxy(proxyList, rotation, currentIndex) {
     if (!proxyList || proxyList.length === 0) return null;
     
@@ -420,6 +547,7 @@ app.get('/api/job-status/:jobId', (req, res) => {
             startedAt: job.startedAt,
             completedAt: job.completedAt,
             stats: job.stats,
+            smtpCount: job.smtpCount || 1,
             logs: job.logs.slice(-100)
         }
     });
@@ -489,12 +617,12 @@ app.get('*', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
     console.log('='.repeat(50));
-    console.log('🚀 SMTP Bulk Email Sender');
+    console.log('🚀 SMTP Bulk Email Sender - Multi SMTP Edition');
     console.log('='.repeat(50));
     console.log(`📡 Server running at: http://localhost:${PORT}`);
-    console.log(`🌐 Open your browser and navigate to: http://localhost:${PORT}`);
-    console.log(`📧 Ready to send bulk emails`);
+    console.log(`🌐 Open your browser: http://localhost:${PORT}`);
+    console.log(`📧 Supports multiple SMTP servers with rotation`);
     console.log('='.repeat(50));
 });
