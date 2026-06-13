@@ -610,7 +610,45 @@ setInterval(() => {
         }
     }
 }, 300000);
-
+// Debug: Check outbound connectivity
+app.get('/api/debug-ports', async (req, res) => {
+    const net = require('net');
+    const results = {};
+    
+    const tests = [
+        { host: 'geoinfotech.co.in', port: 25 },
+        { host: 'geoinfotech.co.in', port: 465 },
+        { host: 'geoinfotech.co.in', port: 587 },
+        { host: 'smtp.gmail.com', port: 587 },
+        { host: 'smtp.office365.com', port: 587 },
+    ];
+    
+    for (const test of tests) {
+        results[`${test.host}:${test.port}`] = await new Promise((resolve) => {
+            const socket = new net.Socket();
+            socket.setTimeout(5000);
+            
+            socket.on('connect', () => {
+                socket.destroy();
+                resolve('OPEN');
+            });
+            
+            socket.on('timeout', () => {
+                socket.destroy();
+                resolve('TIMEOUT/BLOCKED');
+            });
+            
+            socket.on('error', (err) => {
+                socket.destroy();
+                resolve('ERROR: ' + err.message);
+            });
+            
+            socket.connect(test.port, test.host);
+        });
+    }
+    
+    res.json({ success: true, results });
+});
 // Catch-all route to serve frontend
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
